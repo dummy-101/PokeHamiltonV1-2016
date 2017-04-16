@@ -1394,7 +1394,7 @@ def parse_map(args, map_dict, step_location, db_update_queue, wh_update_queue, a
                     (p['last_modified_timestamp_ms'] +
                      p['time_till_hidden_ms']) / 1000.0)
             else:
-                # Set a value of 30 minutes because currently its unknown but larger than 30.
+                # Set a value of 90 Seconds because currently its unknown (Trying To Find TTH)  TESTING~
                 predicted_time = Pokemon.predict_disappear_time(p['spawn_point_id'])
                 if not isinstance(predicted_time, datetime):
                     d_t = datetime.utcfromtimestamp((p['last_modified_timestamp_ms'] + 1800000) / 1000.0)
