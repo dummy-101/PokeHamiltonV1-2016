@@ -1322,8 +1322,7 @@ def check_forced_version(args, curr_forced_api_version, api_check_time, pause_bi
         api_check_time = int(time.time()) + args.version_check_interval
         forced_api = get_api_version(args)
         log.info(('Current Forced API is: {}').format(forced_api))
-        if (curr_forced_api_version != forced_api and
-           forced_api != 0):
+        if (curr_forced_api_version < forced_api and forced_api != 0):
             pause_bit.set()
             log.info(('Started with API: {}, Niantic forced to API: {}').format(curr_forced_api_version, forced_api))
             log.info('Scanner paused due to Niantic forceing the new API.')
