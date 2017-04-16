@@ -1,0 +1,80 @@
+.gym-member {
+  
+  display: inline-block;
+  margin-left: 1px;
+  vertical-align: bottom;
+
+  &.free {
+    width: 30px;
+    height: 30px;
+    background-color: lightgray;
+    border-radius: 5px;
+  }
+&.prestige-bar {
+
+      height: 10px;
+      width: 80%;
+      position: relative;
+      border: 1px solid #000;
+      border-radius: 20px;
+      text-align: left;
+
+      .prestige {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        border-radius: 20px;
+        font-size: .8em;
+        text-align: center;
+        font-family: 'Roboto', sans-serif;
+	 vertical-align: top;
+
+        &.team-1 {
+          background-color: #0000FF;
+        }
+
+        &.team-2 {
+          background-color: #FF0000;
+        }
+
+        &.team-3 {
+          background-color: #FFFF00;
+        }
+      }
+
+      &.team-1 {
+        border-color: darken(#0000FF, 10);
+      }
+
+      &.team-2 {
+        border-color: darken(#FF0000, 10);
+      }
+
+      &.team-3 {
+        border-color: darken(#FFFF00, 10);
+      }
+    }
+  .cp {
+    display: block;
+    border-radius: 5px;
+    text-align: center;
+    vertical-align: middle;
+    font-size: .85em;
+
+    &.team-1 {
+      background-color: #0000FF;
+      color: #000;
+    }
+
+    &.team-2 {
+      background-color: #FF0000;
+      color: #000;
+    }
+
+    &.team-3 {
+      background-color: #FFFF00;
+      color: #000;
+
+    }
+  }
+}

@@ -1,0 +1,1347 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+'''
+Search Architecture:
+ - Have a list of accounts
+ - Create an "overseer" thread
+ - Search Overseer:
+   - Tracks incoming new location values
+   - Tracks "paused state"
+   - During pause or new location will clears current search queue
+   - Starts search_worker threads
+ - Search Worker Threads each:
+   - Have a unique API login
+   - Listens to the same Queue for areas to scan
+   - Can re-login as needed
+   - Pushes finds to db queue and webhook queue
+'''
+
+import logging
+import math
+import os
+import random
+import time
+import geopy
+import geopy.distance
+import requests
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+
+from datetime import datetime, timedelta
+from dateutil import tz
+from threading import Thread, Lock
+from queue import Queue, Empty
+
+from pgoapi import PGoApi
+from pgoapi.utilities import f2i
+from pgoapi import utilities as util
+from pgoapi.exceptions import AuthException
+from pgoapi.hash_server import HashServer
+from geopy.distance import vincenty
+
+from .models import parse_map, GymDetails, parse_gyms, MainWorker, WorkerStatus, PokestopDetails, parse_pokestops
+from .fakePogoApi import FakePogoApi
+from .utils import (now, get_tutorial_state, complete_tutorial, captcha_balance, generate_device_info)
+from .manual_captcha import captcha_verifier
+from .transform import get_new_coords
+import schedulers
+
+import terminalsize
+
+curr_forced_api_version = '0.61.0'
+api_check_time = 0
+
+log = logging.getLogger(__name__)
+
+TIMESTAMP = '\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000'
+
+loginDelayLock = Lock()
+
+
+# Apply a location jitter
+def jitterLocation(location=None, maxMeters=10):
+    origin = geopy.Point(location[0], location[1])
+    b = random.randint(0, 360)
+    d = math.sqrt(random.random()) * (float(maxMeters) / 1000)
+    destination = geopy.distance.distance(kilometers=d).destination(origin, b)
+    return (destination.latitude, destination.longitude, location[2])
+
+
+# Thread to handle user input
+def switch_status_printer(display_type, current_page, logmode):
+    # Get a reference to the root logger.
+    mainlog = logging.getLogger()
+    # Disable logging of the first handler - the stream handler, and disable it's output
+    if (logmode != 'logs'):
+        mainlog.handlers[0].setLevel(logging.CRITICAL)
+
+    while True:
+        # Wait for the user to press a key
+        command = raw_input()
+
+        if command == '':
+            # Switch between logging and display.
+            if display_type[0] != 'logs':
+                # Disable display, enable on screen logging
+                mainlog.handlers[0].setLevel(logging.DEBUG)
+                display_type[0] = 'logs'
+                # If logs are going slowly, sometimes it's hard to tell you switched.  Make it clear.
+                print 'Showing logs...'
+            elif display_type[0] == 'logs':
+                # Enable display, disable on screen logging (except for critical messages)
+                mainlog.handlers[0].setLevel(logging.CRITICAL)
+                display_type[0] = 'workers'
+        elif command.isdigit():
+                current_page[0] = int(command)
+                mainlog.handlers[0].setLevel(logging.CRITICAL)
+        elif command.lower() == 'f':
+                mainlog.handlers[0].setLevel(logging.CRITICAL)
+                display_type[0] = 'failedaccounts'
+        elif command.lower() == 'h':
+            mainlog.handlers[0].setLevel(logging.CRITICAL)
+            display_type[0] = 'hashstatus'
+        elif command.lower() == 'l':
+            mainlog.handlers[0].setLevel(logging.CRITICAL)
+            display_type[0] = 'accountstatus'
+        elif command.lower() == 'w':
+            mainlog.handlers[0].setLevel(logging.CRITICAL)
+            display_type[0] = 'workers'
+        elif command.lower() == 'q':
+            os._exit(0)
+
+# Thread to print out the status of each worker
+def status_printer(threadStatus, search_items_queue_array, db_updates_queue, wh_queue, account_queue, account_failures, hash_key, key_scheduler, logmode):
+
+    if (logmode == 'logs'):
+        display_type = ["logs"]
+    else:
+        display_type = ["workers"]
+
+    current_page = [1]
+
+    # Start another thread to get user input
+    t = Thread(target=switch_status_printer,
+               name='switch_status_printer',
+               args=(display_type, current_page, logmode))
+    t.daemon = True
+    t.start()
+
+    while True:
+        time.sleep(1)
+
+        if display_type[0] == 'logs':
+            # In log display mode, we don't want to show anything
+            continue
+
+        # Create a list to hold all the status lines, so they can be printed all at once to reduce flicker
+        status_text = []
+
+        if display_type[0] == 'workers':
+
+            # Get the terminal size
+            width, height = terminalsize.get_terminal_size()
+            # Queue and overseer take 2 lines.  Switch message takes up 2 lines.  Remove an extra 2 for things like screen status lines.
+            usable_height = height - 6
+            # Prevent people running terminals only 6 lines high from getting a divide by zero
+            if usable_height < 1:
+                usable_height = 1
+
+            # Calculate total skipped items
+            skip_total = 0
+            for item in threadStatus:
+                if 'skip' in threadStatus[item]:
+                    skip_total += threadStatus[item]['skip']
+
+            # Print the queue length
+            search_items_queue_size = 0
+            for i in range(0, len(search_items_queue_array)):
+                search_items_queue_size += search_items_queue_array[i].qsize()
+
+            status_text.append('Queues: {} search items, {} db updates, {} webhook.  Total skipped items: {}. Spare accounts available: {}. Accounts on hold: {}'.format(search_items_queue_size, db_updates_queue.qsize(), wh_queue.qsize(), skip_total, account_queue.qsize(), len(account_failures)))
+
+            # Print status of overseer
+            status_text.append('{} Overseer: {}'.format(threadStatus['Overseer']['scheduler'], threadStatus['Overseer']['message']))
+
+            # Calculate the total number of pages.  Subtracting 1 for the overseer.
+            total_pages = math.ceil((len(threadStatus) - 1) / float(usable_height))
+
+            # Prevent moving outside the valid range of pages
+            if current_page[0] > total_pages:
+                current_page[0] = total_pages
+            if current_page[0] < 1:
+                current_page[0] = 1
+
+            # Calculate which lines to print
+            start_line = usable_height * (current_page[0] - 1)
+            end_line = start_line + usable_height
+            current_line = 1
+
+            # Find the longest username and proxy
+            userlen = 4
+            proxylen = 5
+            for item in threadStatus:
+                if threadStatus[item]['type'] == 'Worker':
+                    userlen = max(userlen, len(threadStatus[item]['user']))
+                    if 'proxy_display' in threadStatus[item]:
+                        proxylen = max(proxylen, len(str(threadStatus[item]['proxy_display'])))
+
+            # How pretty
+            status = '{:10} | {:5} | {:' + str(userlen) + '} | {:' + str(proxylen) + '} | {:7} | {:6} | {:5} | {:7} | {:8} | {:10}'
+
+            # Print the worker status
+            status_text.append(status.format('Worker ID', 'Start', 'User', 'Proxy', 'Success', 'Failed', 'Empty', 'Skipped', 'Captchas', 'Message'))
+            usercount = 0
+            successcount = 0
+            failcount = 0
+            emptycount = 0
+            skipcount = 0
+            captchacount = 0
+            for item in sorted(threadStatus):
+                if(threadStatus[item]['type'] == 'Worker'):
+                    usercount += 1
+                    successcount += threadStatus[item]['success']
+                    failcount += threadStatus[item]['fail']
+                    emptycount += threadStatus[item]['noitems']
+                    skipcount += threadStatus[item]['skip']
+                    captchacount += threadStatus[item]['captchas']
+                    if usercount <= 1:  # item is actually a string = 'Worker 000', so we use another counted variable
+                        elapsed = now() - threadStatus[item]['starttime']   # We only need to set the time once
+                    current_line += 1
+
+                    # Skip over items that don't belong on this page
+                    if current_line < start_line:
+                        continue
+                    if current_line > end_line:
+                        break
+
+                    status_text.append(status.format(item, time.strftime('%H:%M', time.localtime(threadStatus[item]['starttime'])), threadStatus[item]['user'], threadStatus[item]['proxy_display'], threadStatus[item]['success'], threadStatus[item]['fail'], threadStatus[item]['noitems'], threadStatus[item]['skip'], threadStatus[item]['captchas'], threadStatus[item]['message']))
+
+        elif display_type[0] == 'failedaccounts':
+            status_text.append('-----------------------------------------------------------------------------------------------------------------------------------------')
+            status_text.append('Accounts on hold:')
+            status_text.append('-----------------------------------------------------------------------------------------------------------------------------------------')
+
+            # Find the longest account name
+            userlen = 4
+            for account in account_failures:
+                userlen = max(userlen, len(account['account']['username']))
+
+            status = '{:' + str(userlen) + '} | {:10} | {:20}'
+            status_text.append(status.format('User', 'Hold Time', 'Reason'))
+
+            for account in account_failures:
+                status_text.append(status.format(account['account']['username'], time.strftime('%H:%M:%S', time.localtime(account['last_fail_time'])), account['reason']))
+
+        elif display_type[0] == 'hashstatus':
+            status_text.append('-----------------------------------------------------------------------------------------------------------------------------------------')
+            status_text.append('Hash key status:')
+            status_text.append('-----------------------------------------------------------------------------------------------------------------------------------------')
+
+            status = '{:21} | {:9} | {:9} | {:9} | {:9} | {:20}'
+            status_text.append(status.format('Key', 'Remaining', 'Maximum', 'Peak', 'RealTime', 'Expires'))
+
+            for key in hash_key:
+                key_instance = key_scheduler.keys[key]
+                key_text = key
+
+                if key_scheduler.current() == key:
+                    key_text += '*'
+
+                status_text.append(status.format(key_text, key_instance['remaining'], key_instance['maximum'], key_instance['peak'], key_instance['real'], key_instance['expires']))
+
+        elif display_type[0] == 'accountstatus':
+            status_text.append('-----------------------------------------------------------------------------------------------------------------------------------------')
+            status_text.append('Account status:')
+            status_text.append('-----------------------------------------------------------------------------------------------------------------------------------------')
+            # Get the terminal size
+            width, height = terminalsize.get_terminal_size()
+            # Queue and overseer take 2 lines.  Switch message takes up 2 lines.  Remove an extra 2 for things like screen status lines.
+            usable_height = height - 6
+            # Prevent people running terminals only 6 lines high from getting a divide by zero
+            if usable_height < 1:
+                usable_height = 1
+
+            # Calculate the total number of pages.  Subtracting 1 for the overseer.
+            total_pages = math.ceil((len(threadStatus) - 1) / float(usable_height))
+
+            # Prevent moving outside the valid range of pages
+            if current_page[0] > total_pages:
+                current_page[0] = total_pages
+            if current_page[0] < 1:
+                current_page[0] = 1
+
+            # Calculate which lines to print
+            start_line = usable_height * (current_page[0] - 1)
+            end_line = start_line + usable_height
+            current_line = 1
+
+            # Find the longest username and proxy
+            userlen = 4
+            proxylen = 5
+            for item in threadStatus:
+                if threadStatus[item]['type'] == 'Worker':
+                    userlen = max(userlen, len(threadStatus[item]['user']))
+
+            # How pretty
+            status = '{:10} | {:5} | {:' + str(userlen) + '} | {:5} | {:7} | {:5} | {:5} | {:5}'
+
+            # Print the worker status
+            status_text.append(status.format('Worker ID', 'Start', 'User', 'Level', 'NextIn', 'Balls', 'Items', 'Lures'))
+            usercount = 0
+            for item in sorted(threadStatus):
+                if(threadStatus[item]['type'] == 'Worker'):
+                    usercount += 1
+                    if usercount <= 1:  # item is actually a string = 'Worker 000', so we use another counted variable
+                        elapsed = now() - threadStatus[item]['starttime']   # We only need to set the time once
+                    current_line += 1
+
+                    # Skip over items that don't belong on this page
+                    if current_line < start_line:
+                        continue
+                    if current_line > end_line:
+                        break
+
+                    status_text.append(status.format(item, time.strftime('%H:%M', time.localtime(threadStatus[item]['starttime'])), threadStatus[item]['user'], threadStatus[item]['level'], threadStatus[item]['untilNext'], threadStatus[item]['balls'], threadStatus[item]['items'], threadStatus[item]['totalDisks']))
+
+        # Print the status_text for the current screen
+        sph = successcount * 3600 / elapsed
+        eph = emptycount * 3600 / elapsed
+        cph = captchacount * 3600 / elapsed
+        ccost = cph * 0.003
+        cmonth = ccost * 730
+        cday = ccost * 24
+        status_text.append('-----------------------------------------------------------------------------------------------------------------------------------------')
+        status_text.append('Total active: {}  |  Success: {} ({}/hr) | Fails: {} | Empties: {} ({}/hr) | Skips {} | Captchas: {} ({}/hr)| [${:2}/hr]| [${:2}/dy]| [${:2}/mo]'.format(usercount, successcount, sph, failcount, emptycount, eph, skipcount, captchacount, cph, ccost, cday, cmonth))
+        status_text.append('Page {}/{}. Page number. (F) On hold accounts. (H) hash status. (L) levels. (W) workers. <ENTER> status and log view. (Q) force quit.'.format(current_page[0], total_pages))
+        # Clear the screen
+        os.system('cls' if os.name == 'nt' else 'clear')
+        # Print status
+        print "\n".join(status_text)
+
+
+# The account recycler monitors failed accounts and places them back in the account queue 2 hours after they failed.
+# This allows accounts that were soft banned to be retried after giving them a chance to cool down.
+def account_recycler(accounts_queue, account_failures, args):
+    while True:
+        # Run once a minute
+        time.sleep(60)
+        log.info('Account recycler running. Checking status of {} accounts'.format(len(account_failures)))
+
+        # Create a new copy of the failure list to search through, so we can iterate through it without it changing
+        failed_temp = list(account_failures)
+
+        # Search through the list for any item that last failed before 2 hours ago
+        ok_time = now() - args.account_rest_interval
+        for a in failed_temp:
+            if a['last_fail_time'] <= ok_time:
+                # Remove the account from the real list, and add to the account queue
+                log.info('Account {} returning to active duty.'.format(a['account']['username']))
+                account_failures.remove(a)
+                accounts_queue.put(a['account'])
+            else:
+                if 'notified' not in a:
+                    log.info('Account {} needs to cool off for {} minutes due to {}'.format(a['account']['username'], round((a['last_fail_time'] - ok_time) / 60, 0), a['reason']))
+                    a['notified'] = True
+
+def captcha(args, pause_bit):
+    while True:
+        # Pause scanning if 2captcha balance reach under limit
+        if args.captcha_key and captcha_balance(args.captcha_key) <= args.captcha_balance_limit:
+            pause_bit.set()
+            log.info('Searching paused due to 2captcha balance is under limit!')
+        time.sleep(args.captcha_balance_interval)
+
+
+def worker_status_db_thread(threads_status, name, db_updates_queue):
+    log.info("Clearing previous statuses for '%s' worker", name)
+    WorkerStatus.delete().where(WorkerStatus.worker_name == name).execute()
+
+    while True:
+        workers = {}
+        overseer = None
+        for status in threads_status.values():
+            if status['type'] == 'Overseer':
+                overseer = {
+                    'worker_name': name,
+                    'message': status['message'],
+                    'method': status['scheduler'],
+                    'last_modified': datetime.utcnow()
+                }
+            if status['type'] == 'Worker':
+                workers[status['user']] = {
+                    'username': status['user'],
+                    'worker_name': name,
+                    'success': status['success'],
+                    'fail': status['fail'],
+                    'no_items': status['noitems'],
+                    'skip': status['skip'],
+                    'captchas': status['captchas'],
+                    'last_modified': datetime.utcnow(),
+                    'message': status['message']
+                }
+        if overseer is not None:
+            db_updates_queue.put((MainWorker, {0: overseer}))
+            db_updates_queue.put((WorkerStatus, workers))
+        time.sleep(3)
+
+
+# The main search loop that keeps an eye on the over all process
+def search_overseer_thread(args, new_location_queue, pause_bit, heartb, db_updates_queue, wh_queue):
+
+    log.info('Search overseer starting')
+
+    search_items_queue_array = []
+    scheduler_array = []
+    account_queue = Queue()
+    threadStatus = {}
+    key_scheduler = None
+
+    api_check_time = 0
+
+    '''
+    Create a queue of accounts for workers to pull from. When a worker has failed too many times,
+    it can get a new account from the queue and reinitialize the API. Workers should return accounts
+    to the queue so they can be tried again later, but must wait a bit before doing do so to
+    prevent accounts from being cycled through too quickly.
+    '''
+    for i, account in enumerate(args.accounts):
+        account_queue.put(account)
+
+    # Create a list for failed accounts
+    account_failures = []
+
+    threadStatus['Overseer'] = {
+        'message': 'Initializing',
+        'type': 'Overseer',
+        'scheduler': args.scheduler
+    }
+
+    # Create the key scheduler.
+    if args.hash_key:
+        log.info('Enabling hashing key scheduler...')
+        key_scheduler = schedulers.KeyScheduler(args.hash_key)
+
+    if(args.print_status):
+        log.info('Starting status printer thread')
+        t = Thread(target=status_printer,
+                   name='status_printer',
+                   args=(threadStatus, search_items_queue_array, db_updates_queue, wh_queue, account_queue, account_failures, args.hash_key, key_scheduler, args.print_status))
+        t.daemon = True
+        t.start()
+
+    # Create account recycler thread
+    log.info('Starting account recycler thread')
+    t = Thread(target=account_recycler, name='account-recycler', args=(account_queue, account_failures, args))
+    t.daemon = True
+    t.start()
+
+    # Create 2captcha balance watchdog thread
+    if args.captcha_key:
+        log.info('Starting 2captcha balance watchdog thread')
+        t = Thread(target=captcha, name='2captcha', args=(args, pause_bit))
+        t.daemon = True
+        t.start()
+
+    if args.status_name is not None:
+        log.info('Starting status database thread')
+        t = Thread(target=worker_status_db_thread,
+                   name='status_worker_db',
+                   args=(threadStatus, args.status_name, db_updates_queue))
+        t.daemon = True
+        t.start()
+
+    search_items_queue = Queue()
+    # Create the appropriate type of scheduler to handle the search queue.
+    scheduler = schedulers.SchedulerFactory.get_scheduler(args.scheduler, [search_items_queue], threadStatus, args)
+
+    scheduler_array.append(scheduler)
+    search_items_queue_array.append(search_items_queue)
+
+    # Create specified number of search_worker_thread
+    log.info('Starting search worker threads')
+    for i in range(0, args.workers):
+        log.debug('Starting search worker thread %d', i)
+
+        if args.beehive and i > 0:
+        #if args.beehive and i % args.workers_per_hive > 0:
+        #if args.beehive and i % args.workers_per_hive == 0:
+            search_items_queue = Queue()
+            # Create the appropriate type of scheduler to handle the search queue.
+            scheduler = schedulers.SchedulerFactory.get_scheduler(args.scheduler, [search_items_queue], threadStatus, args)
+
+            scheduler_array.append(scheduler)
+            search_items_queue_array.append(search_items_queue)
+
+        # Set proxy for each worker, using round robin
+        proxy_display = 'No'
+        proxy_url = False
+
+        if args.proxy:
+            proxy_display = proxy_url = args.proxy[i % len(args.proxy)]
+            if args.proxy_display.upper() != 'FULL':
+                proxy_display = i % len(args.proxy)
+
+        workerId = 'Worker {:03}'.format(i)
+        threadStatus[workerId] = {
+            'type': 'Worker',
+            'message': 'Creating thread...',
+            'success': 0,
+            'fail': 0,
+            'noitems': 0,
+            'skip': 0,
+            'captchas': 0,
+            'user': '',
+            'level': 0,
+            'untilNext': 0,
+            'balls': 0,
+            'items': 0,
+            'totalDisks' : 0,
+            'proxy_display': proxy_display,
+            'proxy_url': proxy_url,
+            'location': False,
+            'last_scan_time': 0,
+        }
+
+        t = Thread(target=search_worker_thread,
+                   name='search-worker-{}'.format(i),
+                   args=(args, account_queue, account_failures, search_items_queue, pause_bit,
+                         threadStatus[workerId],
+                         db_updates_queue, wh_queue, key_scheduler))
+        t.daemon = True
+        t.start()
+
+    if not args.no_version_check:
+        log.info('Enabling new API force Watchdog.')
+
+    # A place to track the current location
+    current_location = False
+
+    # The real work starts here but will halt on pause_bit.set()
+    while True:
+
+        if args.on_demand_timeout > 0 and (now() - args.on_demand_timeout) > heartb[0]:
+            pause_bit.set()
+            log.info("Searching paused due to inactivity...")
+
+        # Wait here while scanning is paused
+        while pause_bit.is_set():
+            for i in range(0, len(scheduler_array)):
+                scheduler_array[i].scanning_paused()
+            time.sleep(1)
+
+        # If a new location has been passed to us, get the most recent one
+        if not new_location_queue.empty():
+            log.info('New location caught, moving search grid')
+            try:
+                while True:
+                    current_location = new_location_queue.get_nowait()
+            except Empty:
+                pass
+
+            step_distance = 0.45 if args.no_pokemon else 0.07
+
+            locations = _generate_locations(current_location, step_distance, args.step_limit, len(scheduler_array))
+
+            for i in range(0, len(scheduler_array)):
+                scheduler_array[i].location_changed(locations[i])
+
+        # If there are no search_items_queue either the loop has finished (or been
+        # cleared above) -- either way, time to fill it back up
+        for i in range(0, len(search_items_queue_array)):
+            if search_items_queue_array[i].empty():
+                log.debug('Search queue empty, scheduling more items to scan')
+                scheduler_array[i].schedule()
+            else:
+                nextitem = search_items_queue_array[i].queue[0]
+                threadStatus['Overseer']['message'] = 'Processing search queue, next item is {:6f},{:6f},{:6f}'.format(nextitem[1][0], nextitem[1][1], nextitem[1][2])
+                #threadStatus['Overseer']['message'] = 'Processing search queue, next item is {:6f},{:6f}'.format(nextitem[1][0], nextitem[1][1])
+                # If times are specified, print the time of the next queue item, and how many seconds ahead/behind realtime
+                if nextitem[2]:
+                    threadStatus['Overseer']['message'] += ' @ {}'.format(time.strftime('%H:%M:%S', time.localtime(nextitem[2])))
+                    if nextitem[2] > now():
+                        threadStatus['Overseer']['message'] += ' ({}s ahead)'.format(nextitem[2] - now())
+                    else:
+                        threadStatus['Overseer']['message'] += ' ({}s behind)'.format(now() - nextitem[2])
+
+        # New API Watchdog - Check if Niantic forces a new API
+        if not args.no_version_check:
+            api_check_time = check_forced_version(args, curr_forced_api_version,
+                                                  api_check_time, pause_bit)
+
+        # Now we just give a little pause here
+        time.sleep(1)
+
+# Generates the list of locations to scan
+def _generate_locations(current_location, step_distance, step_limit, worker_count):
+    NORTH = 0
+    EAST = 90
+    SOUTH = 180
+    WEST = 270
+
+    xdist = math.sqrt(3) * step_distance  # dist between column centers
+    ydist = 3 * (step_distance / 2)  # dist between row centers
+
+    results = []
+
+    results.append((current_location[0], current_location[1], 0))
+
+    loc = current_location
+    ring = 1
+
+    while len(results) < worker_count:
+
+        loc = get_new_coords(loc, ydist * (step_limit - 1), NORTH)
+        loc = get_new_coords(loc, xdist * (1.5 * step_limit - 0.5), EAST)
+        results.append((loc[0], loc[1], 0))
+
+        for i in range(ring):
+            loc = get_new_coords(loc, ydist * step_limit, NORTH)
+            loc = get_new_coords(loc, xdist * (1.5 * step_limit - 1), WEST)
+            results.append((loc[0], loc[1], 0))
+
+        for i in range(ring):
+            loc = get_new_coords(loc, ydist * (step_limit - 1), SOUTH)
+            loc = get_new_coords(loc, xdist * (1.5 * step_limit - 0.5), WEST)
+            results.append((loc[0], loc[1], 0))
+
+        for i in range(ring):
+            loc = get_new_coords(loc, ydist * (2 * step_limit - 1), SOUTH)
+            loc = get_new_coords(loc, xdist * 0.5, WEST)
+            results.append((loc[0], loc[1], 0))
+
+        for i in range(ring):
+            loc = get_new_coords(loc, ydist * (step_limit), SOUTH)
+            loc = get_new_coords(loc, xdist * (1.5 * step_limit - 1), EAST)
+            results.append((loc[0], loc[1], 0))
+
+        for i in range(ring):
+            loc = get_new_coords(loc, ydist * (step_limit - 1), NORTH)
+            loc = get_new_coords(loc, xdist * (1.5 * step_limit - 0.5), EAST)
+            results.append((loc[0], loc[1], 0))
+
+        # Back to start
+        for i in range(ring - 1):
+            loc = get_new_coords(loc, ydist * (2 * step_limit - 1), NORTH)
+            loc = get_new_coords(loc, xdist * 0.5, EAST)
+            results.append((loc[0], loc[1], 0))
+
+        loc = get_new_coords(loc, ydist * (2 * step_limit - 1), NORTH)
+        loc = get_new_coords(loc, xdist * 0.5, EAST)
+
+        ring += 1
+
+    return results
+
+def search_worker_thread(args, account_queue, account_failures, search_items_queue, pause_bit, status, dbq, whq, key_scheduler):
+
+    step_location = []
+    log.debug('Search worker thread starting')
+
+    # The outer forever loop restarts only when the inner one is intentionally exited - which should only be done when the worker is failing too often, and probably banned.
+    # This reinitializes the API and grabs a new account from the queue.
+    while True:
+        try:
+            status['starttime'] = now()
+
+            # Track per loop.
+            first_login = True
+
+            # Get account
+            status['message'] = 'Waiting to get new account from the queue'
+            log.info(status['message'])
+            account = account_queue.get()
+            status['message'] = 'Switching to account {}'.format(account['username'])
+            status['user'] = account['username']
+            log.info(status['message'])
+
+            # Delay each thread start time so that logins occur after delay.
+            loginDelayLock.acquire()
+            delay = args.login_delay + ((random.random() - .5) / 2)
+            log.debug('Delaying thread startup for %.2f seconds', delay)
+            time.sleep(delay)
+            loginDelayLock.release()
+
+            # New lease of life right here
+            status['fail'] = 0
+            status['success'] = 0
+            status['noitems'] = 0
+            status['skip'] = 0
+            status['captchas'] = 0
+            status['location'] = False
+            status['last_scan_time'] = 0
+
+            # only sleep when consecutive_fails reaches max_failures, overall fails for stat purposes
+            consecutive_fails = 0
+            consecutive_empties = 0
+            firstrun = True
+
+            # Create the API instance this will use
+            if args.mock != '':
+                api = FakePogoApi(args.mock)
+            else:
+                device_info = generate_device_info()
+                api = PGoApi(device_info=device_info)
+
+            if status['proxy_url']:
+                log.debug("Using proxy %s", status['proxy_url'])
+                api.set_proxy({'http': status['proxy_url'], 'https': status['proxy_url']})
+
+            # api.activate_signature(encryption_lib_path)
+
+            # The forever loop for the searches
+            while True:
+
+                # If this account has been messing up too hard, let it rest
+                if consecutive_fails >= args.max_failures:
+                    status['message'] = 'Account {} failed more than {} scans; possibly bad account. Switching accounts...'.format(account['username'], args.max_failures)
+                    log.warning(status['message'])
+                    account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'failures'})
+                    break  # exit this loop to get a new account and have the API recreated
+
+                if consecutive_empties >= args.max_empties:
+                    status['message'] = 'Account {} empty more than {} scans; possibly encountering speedlimit. Switching accounts...'.format(account['username'], args.max_empties)
+                    log.warning(status['message'])
+                    account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'consecutive empties'})
+                    time.sleep(5)
+                    break
+
+                while pause_bit.is_set():
+                    status['message'] = 'Scanning paused'
+                    time.sleep(2)
+
+                # If this account has been running too long, let it rest
+                if (args.account_search_interval is not None):
+                    if (status['starttime'] <= (now() - args.account_search_interval)):
+                        status['message'] = 'Account {} is being rotated out to rest.'.format(account['username'])
+                        log.info(status['message'])
+                        account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'rest interval'})
+                        break
+
+                # Grab the next thing to search (when available)
+                status['message'] = 'Waiting for item from queue'
+                step, next_location, appears, leaves = search_items_queue.get()
+
+                if not firstrun:  # no need to check distance upon login
+                    randomizer = random.uniform(0.7, 1)
+                    sdelay = vincenty(step_location, next_location).meters / ((args.speed_limit / 3.6) * randomizer)  # Classic basic physics formula: time = distance divided by velocity (in km/hr), plus a little randomness between 70 and 100% speed.
+                    status['message'] += ', sleeping {}s until {}'.format(max(sdelay, args.scan_delay), time.strftime('%H:%M:%S', time.localtime(time.time() + max(sdelay, args.scan_delay))))
+                    time.sleep(max(sdelay, args.scan_delay))  # lets sleep here for at least the scan delay time, or to keep us under the speed limiter, whichever is greatest.
+                step_location = next_location
+
+                # too soon?
+                if appears and now() < appears + 10:  # adding a 10 second grace period
+                    first_loop = True
+                    paused = False
+                    while now() < appears + 10:
+                        if pause_bit.is_set():
+                            paused = True
+                            break  # why can't python just have `break 2`...
+                        remain = appears - now() + 10
+                        status['message'] = 'Early for {:6f},{:6f},{:6f}; waiting {}s...'.format(step_location[0], step_location[1], step_location[2], remain)
+                        if first_loop:
+                            log.info(status['message'])
+                            first_loop = False
+                        time.sleep(1)
+                    if paused:
+                        search_items_queue.task_done()
+                        continue
+
+                # too late?
+                extra_delay = check_speed_limit(args, status['location'], step_location, status['last_scan_time'])
+                continue_time = time.time() + extra_delay
+
+                if leaves and continue_time > (leaves - args.min_seconds_left):
+                    search_items_queue.task_done()
+                    status['skip'] += 1
+                    # it is slightly silly to put this in status['message'] since it'll be overwritten very shortly after. Oh well.
+                    if time.time() > (leaves - args.min_seconds_left):
+                        status['message'] = 'Too late for location {:6f},{:6f},{:6f}; skipping'.format(step_location[0], step_location[1], step_location[2])
+                    else:
+                        status['message'] = 'Skipping {:6f},{:6f},{:6f}; outside time and speed constraints'.format(step_location[0], step_location[1], step_location[2])
+                    log.info(status['message'])
+                    # No sleep here; we've not done anything worth sleeping for. Plus we clearly need to catch up!
+                    continue
+
+                # too fast?
+                if extra_delay:
+                    status['message'] = 'Too fast for {:6f},{:6f},{:6f}; waiting {}s...'.format(step_location[0], step_location[1], step_location[2], extra_delay)
+                    log.info(status['message'])
+                    continue_time = time.time() + extra_delay
+
+                    while time.time() < continue_time:
+                        time.sleep(1)
+                        remain = int(continue_time - time.time())
+                        if remain:
+                            status['message'] = 'Too fast for {:6f},{:6f},{:6f}; waiting {}s...'.format(step_location[0], step_location[1], step_location[2], remain)
+
+                # Let the api know where we intend to be for this loop
+                # doing this before check_login so it does not also have to be done there
+                # when the auth token is refreshed
+                api.set_position(*step_location)
+
+                if args.hash_key:
+                    key = key_scheduler.next()
+                    log.info('Using key {} for this scan.'.format(key))
+                    api.activate_hash_server(key)
+
+                # Ok, let's get started -- check our login status
+                check_login(args, account, api, step_location, status['proxy_url'])
+
+                # Only run this when it's the account's first login, after
+                # check_login().
+                if first_login:
+                    first_login = False
+
+                    # Check tutorial completion.
+                    if args.complete_tutorial:
+                        tutorial_state = get_tutorial_state(api, account)
+
+                        if not all(x in tutorial_state for x in (0, 1, 3, 4, 7)):
+                            log.info(
+                                'Completing tutorial steps for %s.', account['username'])
+                            complete_tutorial(api, account, tutorial_state)
+                        else:
+                            log.info(
+                                'Account %s already completed tutorial.', account['username'])
+
+                # putting this message after the check_login so the messages aren't out of order
+                status['message'] = 'Searching at {:6f},{:6f},{:6f}'.format(step_location[0], step_location[1], step_location[2])
+                log.info(status['message'])
+
+                retries = 0  # reset the retry counter
+                parsed = None
+                while retries < 3:
+                    # Make the actual request. (finally!)
+                    response_dict = map_request(api, step_location, args.jitter)
+
+                    # G'damnit, nothing back. Mark it up, sleep, carry on.
+                    if not response_dict:
+                        status['fail'] += 1
+                        consecutive_fails += 1
+                        status['message'] = 'Invalid response at {:6f},{:6f},{:6f}, abandoning location'.format(step_location[0], step_location[1], step_location[2])
+                        log.error(status['message'])
+                        time.sleep(args.scan_delay)
+                        break
+                    #Initial Counts
+                    ITEM_POKE_BALL = 0
+                    ITEM_GREAT_BALL = 0
+                    ITEM_ULTRA_BALL = 0
+
+                    ITEM_POTION = 0
+                    ITEM_SUPER_POTION = 0
+                    ITEM_HYPER_POTION = 0
+                    ITEM_MAX_POTION = 0
+                    ITEM_REVIVE = 0
+                    ITEM_RAZZ_BERRY = 0
+                    ITEM_BLUK_BERRY = 0
+                    ITEM_NANAB_BERRY = 0
+                    ITEM_WEPAR_BERRY = 0
+                    ITEM_PINAP_BERRY = 0
+
+                    level = 0
+                    currentExp = 0
+                    nextLevel = 0
+                    untilNext = 0
+                    totalBalls = 0
+                    totalItems = 0
+                    totalDisks = 0
+
+                    try:
+                        for items in response_dict['responses']['GET_INVENTORY']['inventory_delta']['inventory_items']:
+                            inventory_item_data = items['inventory_item_data']
+                            if 'player_stats' in inventory_item_data:
+                                level = inventory_item_data['player_stats']['level']
+                                currentExp = inventory_item_data['player_stats']['experience']
+                                nextLevel = inventory_item_data['player_stats']['next_level_xp']
+                                untilNext = nextLevel - currentExp
+
+                            #Pokeball Count
+                            if 'item' in inventory_item_data and inventory_item_data['item']['item_id'] is 1: #ITEM_POKE_BALL
+                                ITEM_POKE_BALL = inventory_item_data['item'].get('count', 0)
+                            if 'item' in inventory_item_data and inventory_item_data['item']['item_id'] is 2: #ITEM_GREAT_BALL
+                                ITEM_GREAT_BALL = inventory_item_data['item'].get('count', 0)
+                            if 'item' in inventory_item_data and inventory_item_data['item']['item_id'] is 3: #ITEM_ULTRA_BALL
+                                ITEM_ULTRA_BALL = inventory_item_data['item'].get('count', 0)
+
+                            #Useless Items
+                            if 'item' in inventory_item_data and inventory_item_data['item']['item_id'] is 101: #ITEM_POTION
+                                ITEM_POTION = inventory_item_data['item'].get('count', 0)
+                            if 'item' in inventory_item_data and inventory_item_data['item']['item_id'] is 102: #ITEM_SUPER_POTION
+                                ITEM_SUPER_POTION = inventory_item_data['item'].get('count', 0)
+                            if 'item' in inventory_item_data and inventory_item_data['item']['item_id'] is 103: #ITEM_HYPER_POTION
+                                ITEM_HYPER_POTION = inventory_item_data['item'].get('count', 0)
+                            if 'item' in inventory_item_data and inventory_item_data['item']['item_id'] is 104: #ITEM_MAX_POTION
+                                ITEM_MAX_POTION = inventory_item_data['item'].get('count', 0)
+                            if 'item' in inventory_item_data and inventory_item_data['item']['item_id'] is 201: #ITEM_REVIVE
+                                ITEM_REVIVE = inventory_item_data['item'].get('count', 0)
+                            if 'item' in inventory_item_data and inventory_item_data['item']['item_id'] is 701: #ITEM_RAZZ_BERRY
+                                ITEM_RAZZ_BERRY = inventory_item_data['item'].get('count', 0)
+                            if 'item' in inventory_item_data and inventory_item_data['item']['item_id'] is 702: #ITEM_BLUK_BERRY
+                                ITEM_BLUK_BERRY = inventory_item_data['item'].get('count', 0)
+                            if 'item' in inventory_item_data and inventory_item_data['item']['item_id'] is 703: #ITEM_NANAB_BERRY
+                                ITEM_NANAB_BERRY = inventory_item_data['item'].get('count', 0)
+                            if 'item' in inventory_item_data and inventory_item_data['item']['item_id'] is 704: #ITEM_WEPAR_BERRY
+                                ITEM_WEPAR_BERRY = inventory_item_data['item'].get('count', 0)
+                            if 'item' in inventory_item_data and inventory_item_data['item']['item_id'] is 705: #ITEM_PINAP_BERRY
+                                ITEM_PINAP_BERRY = inventory_item_data['item'].get('count', 0)
+
+                            #Lure Count
+                            if 'item' in inventory_item_data and inventory_item_data['item']['item_id'] == 501: #ITEM_TROY_DISK
+                                totalDisks = inventory_item_data['item'].get('count', 0)
+
+                    except Exception:
+                        log.warning('========API ERROR======== Get-Inventory Failed!')
+
+                    totalBalls = ITEM_POKE_BALL + ITEM_GREAT_BALL + ITEM_ULTRA_BALL
+                    totalItems = ITEM_POTION + ITEM_SUPER_POTION + ITEM_HYPER_POTION + ITEM_MAX_POTION + ITEM_REVIVE + ITEM_RAZZ_BERRY + ITEM_BLUK_BERRY + ITEM_NANAB_BERRY + ITEM_WEPAR_BERRY + ITEM_PINAP_BERRY
+
+                    status['level'] = level
+                    status['untilNext'] = untilNext
+                    status['balls'] = totalBalls
+                    status['items'] = totalItems
+                    status['totalDisks'] = totalDisks
+
+                    # Got the response, check for captcha, parse it out, then send todo's to db/wh queues.
+                    try:
+                        # Captcha check
+                        if args.captcha_solving:
+                            captcha_url = response_dict['responses']['CHECK_CHALLENGE']['challenge_url']
+                            if len(captcha_url) > 1:
+                                status['captchas'] += 1
+                                if args.captcha_key is None:
+                                    if not args.validate_chrome:
+                                        status['message'] = 'Account {} is encountering a captcha, But ChromeDriver is not Installed on your Python Scripts Folder'.format(account['username'])
+                                        log.warning(status['message'])
+                                        account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'ChromeDriver Is not installed'})
+                                        break
+                                    else:
+                                        status['message'] = 'Account {} is encountering a captcha, starting response sequence'.format(account['username'])
+                                        log.warning(status['message'])
+                                        captcha_token = captcha_verifier(captcha_url, status)
+                                        status['message'] = 'Retrieved captcha token, attempting to verify challenge for {}'.format(account['username'])
+                                        log.info(status['message'])
+                                        if captcha_token == 'Fail':
+                                            status['message'] = "Account {} failed verifyChallenge, putting away account for now".format(account['username'])
+                                            log.info(status['message'])
+                                            account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'catpcha failed to verify'})
+                                            break
+                                        else:
+                                            response = api.verify_challenge(token=captcha_token)
+                                            if 'success' in response['responses']['VERIFY_CHALLENGE']:
+                                                status['message'] = "Account {} successfully uncaptcha'd".format(account['username'])
+                                                log.info(status['message'])
+                                            else:
+                                                status['message'] = "Account {} failed verifyChallenge, putting away account for now".format(account['username'])
+                                                log.info(status['message'])
+                                                account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'catpcha failed to verify'})
+                                                break
+                                else:
+                                    status['message'] = 'Account {} is encountering a captcha, starting 2captcha sequence'.format(account['username'])
+                                    log.warning(status['message'])
+                                    captcha_token = token_request(args, status, captcha_url)
+
+                                    if 'ERROR' in captcha_token:
+                                        log.warning("Unable to resolve captcha, please check your 2captcha API key and/or wallet balance")
+                                        account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'catpcha failed to verify'})
+                                        break
+                                    if 'TIMEOUT' in captcha_token:
+                                        log.warning("2captcha server response timed out, service may be temporarily unavailable")
+                                        account_failures.append({'account': account, 'last_fail_time': now() - (args.account_rest_interval - args.captcha_rest_interval), 'reason': '2captcha server time out'})
+                                        break
+
+                                    else:
+                                        status['message'] = 'Retrieved captcha token, attempting to verify challenge for {}'.format(account['username'])
+                                        log.info(status['message'])
+                                        response = api.verify_challenge(token=captcha_token)
+                                        if 'success' in response['responses']['VERIFY_CHALLENGE']:
+                                            status['message'] = "Account {} successfully uncaptcha'd".format(account['username'])
+                                            log.info(status['message'])
+                                            # Make another request for the same coordinate since the previous one was captcha'd
+                                            response_dict = map_request(api, step_location, args.jitter)
+                                        else:
+                                            status['message'] = "Account {} failed verifyChallenge, putting away account for now".format(account['username'])
+                                            log.info(status['message'])
+                                            account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'catpcha failed to verify'})
+                                            break
+
+                        parsed = parse_map(args, response_dict, step_location, dbq, whq, api, status, account)
+                        #search_items_queue.task_done()
+                        if parsed['count'] > 0:
+                            status['success'] += 1
+                            consecutive_empties = 0
+                            #search_items_queue.task_done()
+                            break  # Break out of the retry loop, we got a good scan
+                        else:
+                            if parsed['nearby']:  # If we spot a nearby pokemon, we're not speed limited
+                                status['success'] += 1
+                                consecutive_empties = 0
+                                #search_items_queue.task_done()
+                                break  # Break out of retry loop, good scan, just nothing here
+                            else:
+                                retries += 1
+                                if retries >= 3:
+                                    status['noitems'] += 1  # set this inside an if statement so we only count up after we give up
+                                    consecutive_empties += 1
+                                if parsed['neargym']:
+                                    status['message'] = 'Found a fort, but no pokemon. Either nothing around, or speed limited.'
+                                    log.warning(status['message'])
+                                else:	                   #if not args.no_pokemon:
+                                    status['message'] = 'No nearby pokemon or forts. Either nothing around, softbanned or captched.'
+                                log.warning(status['message'])
+                                time.sleep(args.scan_delay * retries)  # Wait a little longer on each retry to try and beat limiter
+                                continue  # Wait, then try scanning again
+
+                        consecutive_fails = 0
+                        status['message'] = 'Search at {:6f},{:6f},{:6f} completed with {} finds.'.format(step_location[0], step_location[1], step_location[2], parsed['count'])
+                        log.debug(status['message'])
+                    except KeyError:
+                        parsed = False
+                        status['fail'] += 1
+                        consecutive_fails += 1
+                        status['message'] = 'Map parse failed at {:6f},{:6f},{:6f}, abandoning location. {} may be banned.'.format(step_location[0], step_location[1], step_location[2], account['username'])
+                        log.exception(status['message'])
+                        #log.error("BREAK Fired!!")
+                        break
+                        #time.sleep(30)   # SLEEP NEEDED TO STOP ERROR THROTTLE/CAPTCHAS
+
+                # Get detailed information about gyms
+                if args.gym_info and parsed:
+                    # build up a list of gyms to update
+                    gyms_to_update = {}
+                    for gym in parsed['gyms'].values():
+                        # Can only get gym details within 450km of our position
+                        distance = calc_distance(step_location, [gym['latitude'], gym['longitude']])
+                        if distance < 0.45:
+                            # check if we already have details on this gym (if not, get them)
+                            try:
+                                record = GymDetails.get(gym_id=gym['gym_id'])
+                            except GymDetails.DoesNotExist as e:
+                                gyms_to_update[gym['gym_id']] = gym
+                                continue
+
+                            # if we have a record of this gym already, check if the gym has been updated since our last update
+                            if record.last_scanned < gym['last_modified']:
+                                gyms_to_update[gym['gym_id']] = gym
+                                continue
+                            else:
+                                log.debug('Skipping update of gym @ %f/%f, up to date', gym['latitude'], gym['longitude'])
+                                continue
+                        else:
+                            log.debug('Skipping update of gym @ %f/%f, too far away from our location at %f/%f/%f (%fkm)', gym['latitude'], gym['longitude'], step_location[0], step_location[1], step_location[2], distance)
+
+                    if len(gyms_to_update):
+                        gym_responses = {}
+                        current_gym = 1
+                        status['message'] = 'Updating {} gyms for location {},{},{}...'.format(len(gyms_to_update), step_location[0], step_location[1], step_location[2])
+                        log.debug(status['message'])
+
+                        for gym in gyms_to_update.values():
+                            status['message'] = 'Getting details for gym {} of {} for location {},{},{}...'.format(current_gym, len(gyms_to_update), step_location[0], step_location[1], step_location[2])
+                            time.sleep(random.random() + 2)
+                            response = gym_request(api, step_location, gym)
+
+                            try:
+                                # make sure the gym was in range. (sometimes the API gets cranky about gyms that are ALMOST 1km away)
+                                if response['responses']['GET_GYM_DETAILS']['result'] == 2:
+                                    log.warning('Gym @ %f/%f is out of range (%dkm), skipping', gym['latitude'], gym['longitude'], distance)
+                                else:
+                                    gym_responses[gym['gym_id']] = response['responses']['GET_GYM_DETAILS']
+                            except Exception:
+                                log.warning('========API ERROR======== Get-Gym Failed!')
+
+                            # increment which gym we're on (for status messages)
+                            current_gym += 1
+
+                        status['message'] = 'Processing details of {} gyms for location {},{},{}...'.format(len(gyms_to_update), step_location[0], step_location[1], step_location[2])
+                        log.debug(status['message'])
+
+                        if gym_responses:
+                            parse_gyms(args, gym_responses, whq)
+
+
+                # seems like there issnt a range limit on scanning pokestops
+                if args.pokestop_info and parsed:
+                    # build up a list of gyms to update
+                    pokestops_to_update = {}
+                    for pokestop in parsed['pokestops'].values():
+                        # check if we already have details on this pokestop (if not, get them)
+                        try:
+                            record = PokestopDetails.get(pokestop_id=pokestop['pokestop_id'])
+
+                            if args.pokestop_info_expire and args.pokestop_info_expire > 0:
+                                if (datetime.utcnow() + timedelta(minutes=args.pokestop_info_expire)) > record.last_scanned:
+                                    pokestops_to_update[pokestop['pokestop_id']] = pokestop
+                                    continue
+                        except PokestopDetails.DoesNotExist as e:
+                            pokestops_to_update[pokestop['pokestop_id']] = pokestop
+                            continue
+
+                        log.debug('Skipping update of pokestop @ %f/%f, up to date', pokestop['latitude'], pokestop['longitude'])
+                        continue
+
+                    if len(pokestops_to_update):
+                        pokestop_responses = {}
+                        current_pokestop = 1
+                        status['message'] = 'Updating {} pokestops for location {},{}...'.format(len(pokestops_to_update), step_location[0], step_location[1])
+                        log.warning(status['message'])
+
+                        for pokestop in pokestops_to_update.values():
+                            status['message'] = 'Getting details for pokestop {} of {} for location {},{}...'.format(current_pokestop, len(pokestops_to_update), step_location[0], step_location[1])
+                            time.sleep(random.random() + 2)
+                            response = pokestop_request(api, step_location, pokestop)
+
+                            try:
+                                pokestop_responses[pokestop['pokestop_id']] = response['responses']['FORT_DETAILS']
+                            except Exception:
+                                log.warning('========API ERROR======== Get-Pokestop Failed!')
+
+                            # increment which pokestop we're on (for status messages)
+                            current_pokestop += 1
+
+                        status['message'] = 'Processing details of {} pokestop for location {},{}...'.format(len(pokestops_to_update), step_location[0], step_location[1])
+                        log.warning(status['message'])
+
+                        if pokestop_responses:
+                            parse_pokestops(args, pokestop_responses)
+
+
+                if args.hash_key:
+                    #key_instance = key_scheduler.keys[key_scheduler.current()]
+                    key_instance = key_scheduler.keys[key]
+                    key_instance['remaining'] = HashServer.status.get('remaining', 0)
+
+                    if key_instance['maximum'] == 0:
+                        key_instance['maximum'] = HashServer.status.get('maximum', 0)
+
+                    peak = key_instance['maximum'] - key_instance['remaining']
+
+                    if key_instance['peak'] < peak:
+                        key_instance['peak'] = peak
+
+                    real = key_instance['maximum'] - key_instance['remaining']
+                    key_instance['real'] = real
+
+                    if key_instance['expires'] == 'N/A':
+                        expires = HashServer.status.get(
+                            'expiration', 'N/A')
+
+                        if expires != 'N/A':
+                            expires = datetime.utcfromtimestamp(
+                                int(expires))
+
+                            from_zone = tz.tzutc()
+                            to_zone = tz.tzlocal()
+
+                            expires = expires.replace(tzinfo=from_zone)
+                            expires = expires.astimezone(to_zone)
+                            expires = expires.strftime('%Y-%m-%d %H:%M:%S')
+
+                            key_instance['expires'] = expires
+
+                # Record the time and place the worker left off at
+                status['last_scan_time'] = now()
+                status['location'] = step_location
+
+                # finished our first run
+                firstrun = False
+
+        # catch any process exceptions, log them, and continue the thread
+        except Exception as e:
+            status['message'] = 'Exception in search_worker using account {}. Restarting with fresh account. See logs for details.'.format(account['username'])
+            time.sleep(args.scan_delay)
+            log.error('Exception in search_worker under account {} Exception message: {}'.format(account['username'], e))
+            account_failures.append({'account': account, 'last_fail_time': now(), 'reason': 'exception'})
+
+
+def check_login(args, account, api, position, proxy_url):
+
+    # Logged in? Enough time left? Cool!
+    if api._auth_provider and api._auth_provider._ticket_expire:
+        remaining_time = api._auth_provider._ticket_expire / 1000 - time.time()
+        if remaining_time > 60:
+            log.debug('Credentials remain valid for another %f seconds', remaining_time)
+            return
+
+    # Try to login (a few times, but don't get stuck here)
+    i = 0
+    while i < args.login_retries:
+        try:
+            if proxy_url:
+                api.set_authentication(provider=account['auth_service'], username=account['username'], password=account['password'], proxy_config={'http': proxy_url, 'https': proxy_url})
+            else:
+                api.set_authentication(provider=account['auth_service'], username=account['username'], password=account['password'])
+            break
+        except AuthException:
+            if i >= args.login_retries:
+                raise TooManyLoginAttempts('Exceeded login attempts')
+            else:
+                i += 1
+                log.error('Failed to login to Pokemon Go with account %s. Trying again in %g seconds', account['username'], args.login_delay)
+                time.sleep(args.login_delay)
+
+    log.debug('Login for account %s successful', account['username'])
+    time.sleep(20)
+
+
+def map_request(api, position, jitter=False):
+    # create scan_location to send to the api based off of position, because tuples aren't mutable
+    if jitter:
+        # jitter it, just a little bit.
+        scan_location = jitterLocation(position)
+        log.debug('Jittered to: %f/%f', scan_location[0], scan_location[1])
+    else:
+        # Just use the original coordinates
+        scan_location = position
+
+    try:
+        cell_ids = util.get_cell_ids(scan_location[0], scan_location[1])
+        timestamps = [0, ] * len(cell_ids)
+        req = api.create_request()
+        response = req.get_map_objects(latitude=f2i(scan_location[0]),
+                                       longitude=f2i(scan_location[1]),
+                                       since_timestamp_ms=timestamps,
+                                       cell_id=cell_ids)
+        response = req.check_challenge()
+        response = req.get_hatched_eggs()
+        response = req.get_inventory()
+        response = req.check_awarded_badges()
+        response = req.download_settings()
+        response = req.get_buddy_walked()
+        response = req.call()
+        return response
+
+    except Exception as e:
+        log.warning('Exception while downloading map: %s', e)
+        return False
+
+
+def gym_request(api, position, gym):
+    try:
+        log.debug('Getting details for gym @ %f/%f (%fkm away)', gym['latitude'], gym['longitude'], calc_distance(position, [gym['latitude'], gym['longitude']]))
+        req = api.create_request()
+        x = req.get_gym_details(gym_id=gym['gym_id'],
+                                player_latitude=f2i(position[0]),
+                                player_longitude=f2i(position[1]),
+                                gym_latitude=gym['latitude'],
+                                gym_longitude=gym['longitude'])
+        x = req.check_challenge()
+        x = req.get_hatched_eggs()
+        x = req.get_inventory()
+        x = req.check_awarded_badges()
+        x = req.download_settings()
+        x = req.get_buddy_walked()
+        x = req.call()
+        # print pretty(x)
+        return x
+
+    except Exception as e:
+        log.warning('Exception while downloading gym details: %s', e)
+        return False
+
+def pokestop_request(api, position, pokestop):
+    try:
+        log.debug('Getting details for pokestop @ %f/%f (%fkm away)', pokestop['latitude'], pokestop['longitude'], calc_distance(position, [pokestop['latitude'], pokestop['longitude']]))
+        x = api.fort_details(fort_id=pokestop['pokestop_id'],
+                             latitude=pokestop['latitude'],
+                             longitude=pokestop['longitude'])
+
+        return x
+
+    except Exception as e:
+        log.warning('Exception while downloading pokestop details: %s', e)
+        return False
+
+
+def token_request(args, status, url):
+    s = requests.Session()
+    # Fetch the CAPTCHA_ID from 2captcha
+    try:
+        captcha_id = s.post("http://2captcha.com/in.php?key={}&method=userrecaptcha&googlekey={}&pageurl={}".format(args.captcha_key, args.captcha_dsk, url), timeout=30).text.split('|')[1]
+        captcha_id = str(captcha_id)
+    # Gracefully handle 2captcha.com timeout
+    except requests.Timeout:
+        return 'TIMEOUT'
+    # IndexError implies that the retuned response was a 2captcha error
+    except IndexError:
+        return 'ERROR'
+    status['message'] = 'Retrieved captcha ID: {}; now retrieving token'.format(captcha_id)
+    log.info(status['message'])
+    # Get the response, retry every 5 seconds if its not ready
+    recaptcha_response = s.get("http://2captcha.com/res.php?key={}&action=get&id={}".format(args.captcha_key, captcha_id)).text
+    while 'CAPCHA_NOT_READY' in recaptcha_response:
+        log.info("Captcha token is not ready, retrying in 5 seconds")
+        time.sleep(5)
+        recaptcha_response = s.get("http://2captcha.com/res.php?key={}&action=get&id={}".format(args.captcha_key, captcha_id)).text
+    token = str(recaptcha_response.split('|')[1])
+    return token
+
+
+def calc_distance(pos1, pos2):
+    R = 6378.1  # km radius of the earth
+
+    dLat = math.radians(pos1[0] - pos2[0])
+    dLon = math.radians(pos1[1] - pos2[1])
+
+    a = math.sin(dLat / 2) * math.sin(dLat / 2) + \
+        math.cos(math.radians(pos1[0])) * math.cos(math.radians(pos2[0])) * \
+        math.sin(dLon / 2) * math.sin(dLon / 2)
+
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    d = R * c
+
+    return d
+
+
+def check_speed_limit(args, previous_location, next_location, last_scan_time):
+    if args.speed_limit > 0 and last_scan_time > 0:
+        move_distance = calc_distance(previous_location, next_location)
+        time_elapsed = time.time() - last_scan_time
+
+        if time_elapsed <= 0:
+            time_elapsed = 0.001
+        projected_speed = 3600.0 * move_distance / time_elapsed
+
+        if projected_speed > args.speed_limit:
+            extra_delay = int(move_distance / args.speed_limit * 3600.0 - time_elapsed) + 1
+
+            if args.max_speed_limit_delay and extra_delay > args.max_speed_limit_delay:
+                return args.max_speed_limit_delay
+            else:
+                return extra_delay
+
+    return 0
+
+
+class TooManyLoginAttempts(Exception):
+    pass
+
+
+def check_forced_version(args, curr_forced_api_version, api_check_time, pause_bit):
+    if int(time.time()) > api_check_time:
+        api_check_time = int(time.time()) + args.version_check_interval
+        forced_api = get_api_version(args)
+        log.info(('Current Forced API is: {}').format(forced_api))
+        if (curr_forced_api_version != forced_api and
+           forced_api != 0):
+            pause_bit.set()
+            log.info(('Started with API: {}, Niantic forced to API: {}').format(curr_forced_api_version, forced_api))
+            log.info('Scanner paused due to Niantic forceing the new API.')
+            log.info('Scanner has paused to prevent issues.')
+
+    return api_check_time
+
+
+def get_api_version(args):
+    try:
+        s = requests.Session()
+        s.mount('https://', HTTPAdapter(max_retries=Retry(total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])))
+        r = s.get(
+            'https://pgorelease.nianticlabs.com/plfe/version',
+            verify=False)
+        return r.text[2:] if (r.status_code == requests.codes.ok and
+                              r.text[2:].count('.') == 2) else 0
+
+    except Exception:
+        log.warning('error on API check: %s')
+        return 0
